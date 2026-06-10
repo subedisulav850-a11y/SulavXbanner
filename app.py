@@ -3,7 +3,6 @@ import os
 import re
 import asyncio
 import httpx
-import base64
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -28,15 +27,20 @@ PRIME8_FRAME_FILE = "prime8frame.png"
 
 # Real API endpoint
 INFO_API_URL = "https://info.killersharmabot.online/player-info"
-# CDN URL (verified working)
+# CDN URL as requested
 CDN_URL = "https://cdn.jsdelivr.net/gh/ShahGCreator/icon@main/PNG"
 
 # ================= Lifespan =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load prime assets once at startup
     app.state.prime_images = load_prime_images()
     app.state.prime8_frame = load_prime8_frame()
+    app.state.client = httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20.0,
+        follow_redirects=True
+    )
+    app.state.thread_pool = ThreadPoolExecutor(max_workers=4)
     yield
     await app.state.client.aclose()
     app.state.thread_pool.shutdown()
@@ -49,39 +53,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.state.client = httpx.AsyncClient(
-    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-    timeout=20.0,
-    follow_redirects=True
-)
-app.state.thread_pool = ThreadPoolExecutor(max_workers=4)
-
-# ================= Helper functions =================
+# ================= Helper Functions =================
 def clean_text(text: str) -> str:
     if not text:
         return ""
+    # Remove invisible Unicode characters
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200b\uFEFF\uf8ff]', '', str(text))
     return ' '.join(text.split())
 
 def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
+    """Wrap text into two lines maximum, splitting at spaces."""
     words = text.split()
-    lines = []
-    current_line = []
-    for word in words:
-        test_line = ' '.join(current_line + [word])
-        bbox = font.getbbox(test_line)
-        width = bbox[2] - bbox[0]
-        if width <= max_width:
-            current_line.append(word)
-        else:
-            if current_line:
-                lines.append(' '.join(current_line))
-                current_line = [word]
-            else:
-                lines.append(word)
-    if current_line:
-        lines.append(' '.join(current_line))
-    return lines if lines else [text]
+    if not words:
+        return [text]
+    # Try to put first part on line 1, rest on line 2
+    for i in range(1, len(words)):
+        line1 = ' '.join(words[:i])
+        line2 = ' '.join(words[i:])
+        bbox1 = font.getbbox(line1)
+        bbox2 = font.getbbox(line2)
+        if (bbox1[2] - bbox1[0] <= max_width) and (bbox2[2] - bbox2[0] <= max_width):
+            return [line1, line2]
+    # If cannot split nicely, return original as single line
+    return [text]
 
 def load_unicode_font(size: int, font_file: str = FONT_FILE):
     try:
@@ -137,8 +131,6 @@ async def fetch_image_bytes(item_id: str) -> Optional[bytes]:
         resp = await app.state.client.get(url)
         if resp.status_code == 200:
             return resp.content
-        else:
-            print(f"Failed {url}: {resp.status_code}")
     except Exception as e:
         print(f"Error fetching {item_id}: {e}")
     return None
@@ -149,9 +141,10 @@ def bytes_to_image(img_bytes: Optional[bytes]) -> Image.Image:
             return Image.open(io.BytesIO(img_bytes)).convert("RGBA")
         except:
             pass
+    # Fallback grey square
     return Image.new("RGBA", (400, 400), (200, 200, 200, 255))
 
-# ================= Data extraction =================
+# ================= Data Extraction =================
 def extract_player_data(data: Dict[str, Any]) -> Dict[str, Any]:
     basic = data.get("basicInfo", {})
     clan = data.get("clanBasicInfo", {})
@@ -164,6 +157,7 @@ def extract_player_data(data: Dict[str, Any]) -> Dict[str, Any]:
     banner_id = str(basic.get("bannerId", ""))
     prime_level = int(basic.get("primeLevel", {}).get("level", 0))
 
+    # Creation date (for prime 8 layout)
     create_at = basic.get("createAt", "")
     since_text = ""
     if create_at and str(create_at).isdigit():
@@ -182,7 +176,7 @@ def extract_player_data(data: Dict[str, Any]) -> Dict[str, Any]:
         "prime_level": prime_level, "since_text": since_text, "country": country
     }
 
-# ================= Image processing =================
+# ================= Image Processing =================
 def process_banner_image(avatar_bytes: Optional[bytes],
                          banner_bytes: Optional[bytes],
                          player: Dict[str, Any]) -> io.BytesIO:
@@ -228,6 +222,7 @@ def process_banner_image(avatar_bytes: Optional[bytes],
     name_x = TARGET_HEIGHT + 65
     max_text_width = new_banner_w - 100
 
+    # Fonts
     font_name = load_unicode_font(110)
     font_name_cherokee = load_unicode_font(110, FONT_CHEROKEE)
     font_guild = load_unicode_font(80)
@@ -244,7 +239,7 @@ def process_banner_image(avatar_bytes: Optional[bytes],
         if player["guild"]:
             draw_text_stroked(draw, name_x, y, player["guild"], font_guild, font_guild_cherokee, 3)
 
-    # ----- Prime level 8 special layout -----
+    # ----- Prime level 8 special layout (frame + extra fields) -----
     else:
         font_since = load_unicode_font(65)
         font_since_cherokee = load_unicode_font(65, FONT_CHEROKEE)
@@ -258,8 +253,10 @@ def process_banner_image(avatar_bytes: Optional[bytes],
             draw_text_stroked(draw, name_x, y, player["since_text"], font_since, font_since_cherokee, 2)
             y += 55
         y += 20
-        draw_text_stroked(draw, name_x, y, player["name"], font_name, font_name_cherokee, 4)
-        y += 95
+        name_lines = wrap_text(player["name"], font_name, max_text_width)
+        for line in name_lines:
+            draw_text_stroked(draw, name_x, y, line, font_name, font_name_cherokee, 4)
+            y += 85
         if player["guild"]:
             draw_text_stroked(draw, name_x, y, player["guild"], font_guild, font_guild_cherokee, 3)
             y += 70
@@ -285,13 +282,12 @@ def process_banner_image(avatar_bytes: Optional[bytes],
     img_io.seek(0)
     return img_io
 
-# ================= API endpoint =================
+# ================= API Endpoints =================
 @app.get("/profile")
 async def get_banner(uid: str):
     if not uid:
         raise HTTPException(status_code=400, detail="UID required")
 
-    # Fetch player info from real API
     resp = await app.state.client.get(f"{INFO_API_URL}?uid={uid}")
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="Info API Error")
@@ -299,7 +295,6 @@ async def get_banner(uid: str):
 
     player = extract_player_data(data)
 
-    # Fetch images concurrently
     avatar_task = fetch_image_bytes(player["avatar_id"])
     banner_task = fetch_image_bytes(player["banner_id"])
     avatar_bytes, banner_bytes = await asyncio.gather(avatar_task, banner_task)
@@ -316,6 +311,11 @@ async def get_banner(uid: str):
     return Response(content=img_io.getvalue(), media_type="image/png",
                     headers={"Cache-Control": "public, max-age=300"})
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
